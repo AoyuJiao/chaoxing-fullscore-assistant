@@ -1,0 +1,80 @@
+name: Sync Greasy Fork
+
+on:
+  schedule:
+    # 12:23 in China (04:23 UTC), daily.
+    - cron: '23 4 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: greasy-fork-mirror
+  cancel-in-progress: false
+
+env:
+  SCRIPT_URL: https://update.greasyfork.org/scripts/436994/script.user.js
+  MIRROR_FILE: script.user.js
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+
+      - name: Download, verify and commit if changed
+        shell: bash
+        run: |
+          set -euo pipefail
+          tmp="$(mktemp)"
+          trap 'rm -f -- "$tmp"' EXIT
+
+          status="$(curl --silent --show-error --fail --proto '=https' \
+            --connect-timeout 10 --max-time 30 --max-filesize 5242880 \
+            --output "$tmp" --write-out '%{http_code}' "$SCRIPT_URL")"
+          if [[ "$status" != 200 ]]; then
+            echo "Unexpected HTTP status: $status" >&2
+            exit 1
+          fi
+
+          version="$(python3 - "$tmp" <<'PY'
+          import re
+          import sys
+          from pathlib import Path
+
+          lines = Path(sys.argv[1]).read_text(encoding="utf-8-sig").splitlines()
+          if not lines or lines[0].strip() != "// ==UserScript==":
+              sys.exit("Download is not a userscript; the mirror was not changed.")
+          try:
+              end = next(i for i, line in enumerate(lines[1:200], 1)
+                         if line.strip() == "// ==/UserScript==")
+          except StopIteration:
+              sys.exit("Userscript header is incomplete; the mirror was not changed.")
+          for line in lines[1:end]:
+              match = re.fullmatch(r"//\s+@version\s+([0-9A-Za-z._+~-]{1,80})\s*", line)
+              if match:
+                  print(match[1])
+                  break
+          else:
+              sys.exit("Missing or unsupported @version; the mirror was not changed.")
+          PY
+          )"
+
+          # Preserve the upstream file byte for byte. Never execute it.
+          cp -- "$tmp" "$MIRROR_FILE"
+          git add -- "$MIRROR_FILE"
+          if git diff --cached --quiet -- "$MIRROR_FILE"; then
+            echo "No change (upstream version $version)."
+            exit 0
+          fi
+
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m "Sync Greasy Fork v$version" -- "$MIRROR_FILE"
+          git push origin "HEAD:refs/heads/$DEFAULT_BRANCH"
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
